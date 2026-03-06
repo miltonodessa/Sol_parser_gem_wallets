@@ -186,7 +186,7 @@ def _load_file_wallets(path: str) -> List[str]:
 
 
 def _ask_scan_limit() -> int:
-    """Prompt the user to enter how many wallets to scan. Validates input."""
+    """Prompt the user to enter how many wallets to scan. Returns 0 for unlimited."""
     print("  How many wallets do you want to scan?")
     print("  (Enter a number, e.g. 500 / 5000 / 50000 — or 0 for unlimited)\n")
     while True:
@@ -195,7 +195,9 @@ def _ask_scan_limit() -> int:
             val = int(raw)
             if val < 0:
                 raise ValueError
-            return val if val > 0 else 10_000_000   # 0 → unlimited
+            if val == 0:
+                print("  → Unlimited mode: will scan all wallets found.")
+            return val
         except (ValueError, EOFError):
             print("  Please enter a valid positive integer (or 0 for unlimited).")
 
@@ -265,11 +267,16 @@ def main() -> None:
     )
 
     # ── Scan limit (interactive if not passed via CLI) ───────────────────────
-    scan_limit: int = args.scan_limit if args.scan_limit is not None else _ask_scan_limit()
+    _UNLIMITED = 10_000_000
+    if args.scan_limit is None:
+        raw_limit = _ask_scan_limit()
+    else:
+        raw_limit = args.scan_limit
+    scan_limit: int = _UNLIMITED if raw_limit == 0 else raw_limit
     print()
 
     period_label = f"{filter_cfg.period_days}d" if filter_cfg.period_days else "Max"
-    limit_label  = f"{scan_limit:,}" if scan_limit < 10_000_000 else "Unlimited"
+    limit_label  = f"{scan_limit:,}" if scan_limit < _UNLIMITED else "Unlimited"
     print(f"  Period     : {period_label}")
     print(f"  Scan limit : {limit_label} wallets")
     print(f"  Scan depth : {args.scan_depth} txs/program")

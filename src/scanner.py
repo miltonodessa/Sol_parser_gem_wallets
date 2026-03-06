@@ -89,12 +89,13 @@ class BlockchainScanner:
             if verbose:
                 print(f"  Scanning {label} ({prog_id[:12]}…)", flush=True)
 
+            remaining = max_wallets - len(discovered)   # always > 0 here
             prog_wallets = self._scan_program(
                 prog_id,
                 max_txs=scan_txs_per_program,
                 cutoff=cutoff,
                 seen=seen_wallets,
-                cap=max_wallets - len(discovered),
+                cap=remaining,
             )
 
             discovered.extend(prog_wallets)
@@ -108,7 +109,10 @@ class BlockchainScanner:
 
             if len(discovered) >= max_wallets:
                 if verbose:
-                    print(f"  Reached --scan-limit {max_wallets}, stopping scan.")
+                    limit_str = (
+                        f"{max_wallets:,}" if max_wallets < 10_000_000 else "unlimited"
+                    )
+                    print(f"  Reached scan-limit ({limit_str}), stopping scan.")
                 break
 
         return discovered
@@ -143,7 +147,11 @@ class BlockchainScanner:
             url = f"{cfg.HELIUS_API_URL}/addresses/{program_id}/transactions"
             batch = self._fetcher._get(url, params=params)
 
+            if batch is None:
+                # API error (network / auth) — stop paging this program
+                break
             if not batch:
+                # empty page — no more transactions
                 break
 
             for tx in batch:
