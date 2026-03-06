@@ -2,39 +2,47 @@
 """
 main.py — Froggy Scanner: Solana Wallet Parser
 =================================================
-Fetch, analyse and filter Solana wallets using the Helius Enhanced
-Transactions API, then export to Excel / TXT with GMGN token links.
+Scans the Solana blockchain for active DEX traders, analyses every discovered
+wallet, applies filters, and exports results to Excel / TXT.
+
+No input file is needed.  The scanner discovers wallets by reading recent
+SWAP transactions directly from DEX program accounts on-chain.
 
 Quick start
 -----------
-1. Copy .env.example → .env and fill in your HELIUS_API_KEY
-   (free key at https://www.helius.dev/)
-2. Create a file with one wallet address per line, e.g. wallets.txt
-3. Run:
-       python main.py -i wallets.txt
+  # copy .env.example → .env  and fill in HELIUS_API_KEY
+  python main.py
 
-Full example with filters:
-       python main.py -i wallets.txt \\
-         --period-days 30 \\
-         --min-sol-invest 0.1 \\
-         --winrate-min 50 \\
-         --pnl-min 1.0 \\
-         --roi-min 50 \\
-         --total-trades-min 10 \\
-         --last-trade-max 7d \\
-         --rockets-x2 \\
-         --format Excel+TXT \\
-         --extended
+  # scan specific DEX only, top-1000 wallets, last 30 days
+  python main.py --scan-programs pump raydium --scan-limit 1000 --period-days 30
+
+  # add filters and export
+  python main.py \\
+    --period-days 30           \\
+    --min-sol-invest 0.1       \\
+    --winrate-min 50           \\
+    --pnl-min 1.0              \\
+    --roi-min 50               \\
+    --total-trades-min 10      \\
+    --last-trade-max 7d        \\
+    --rockets-x2               \\
+    --format Excel+TXT         \\
+    --extended
+
+  # also accept a list of known addresses (appended to scanned set)
+  python main.py -i extra_wallets.txt --scan-limit 500
 """
 
 import argparse
 import sys
+from typing import List, Optional, Set
 
 from config import HELIUS_API_KEY, FilterConfig
 from src.fetcher import WalletFetcher
 from src.analyzer import WalletAnalyzer
 from src.filters import FilterEngine
 from src.exporter import DataExporter
+from src.scanner import BlockchainScanner, SCAN_PROGRAMS, PROGRAM_ALIASES
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -42,23 +50,41 @@ from src.exporter import DataExporter
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="froggy-scanner",
-        description="Froggy Scanner — Solana Wallet Parser",
+        description="Froggy Scanner — scans Solana DEX activity, analyses wallets, exports results",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
-    # ── Input / Output ──────────────────────────────────────────────────────
-    p.add_argument("-i", "--input", required=True,
-                   help="Input file — one Solana wallet address per line "
-                        "(lines starting with # are ignored)")
+    # ── Blockchain scan ─────────────────────────────────────────────────────
+    scan = p.add_argument_group("Blockchain scan")
+    scan.add_argument("--scan-limit", type=int, default=1000,
+                      metavar="N",
+                      help="Max unique wallets to discover from the blockchain "
+                           "(default: 1000)")
+    scan.add_argument("--scan-depth", type=int, default=2000,
+                      metavar="N",
+                      help="Max transactions to read per DEX program "
+                           "(default: 2000)")
+    scan.add_argument("--scan-programs", nargs="+", default=None,
+                      metavar="NAME",
+                      help="DEX programs to scan.  Use aliases: "
+                           + ", ".join(sorted(PROGRAM_ALIASES)) +
+                           ".  Default: all.")
+
+    # ── Optional extra wallet file ───────────────────────────────────────────
+    p.add_argument("-i", "--input", default=None,
+                   help="Optional extra file with wallet addresses "
+                        "(one per line, # = comment).  "
+                        "These are appended to wallets found by the scanner.")
+
+    # ── Output ──────────────────────────────────────────────────────────────
     p.add_argument("-o", "--output-dir", default="output",
                    help="Directory for output files (default: output/)")
     p.add_argument("--format", default="Excel",
                    choices=["Excel", "Excel+TXT", "TXT"],
                    help="Output format (default: Excel)")
     p.add_argument("--extended", action="store_true",
-                   help="Extended mode: add a Token Trades sheet with every "
-                        "individual token position and GMGN links")
+                   help="Add a Token Trades sheet with GMGN links per token")
     p.add_argument("--no-filters", action="store_true",
                    help="Disable all filters — export every wallet analysed")
 
@@ -69,8 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Token SOL Invest ────────────────────────────────────────────────────
     p.add_argument("--min-sol-invest", type=float, default=None,
                    metavar="{5|1|0.5|0.1|0.05}",
-                   help="Minimum SOL invested per token to include in analysis "
-                        "(default: All — no minimum)")
+                   help="Min SOL invested per token (default: All)")
 
     # ── Period ──────────────────────────────────────────────────────────────
     period_grp = p.add_mutually_exclusive_group()
@@ -79,17 +104,13 @@ def build_parser() -> argparse.ArgumentParser:
                              metavar="{1|7|14|30|45|90}",
                              help="Analysis window in days (default: 45)")
     period_grp.add_argument("--period-max", action="store_true",
-                             help="Use full history (Max period)")
+                             help="Use full on-chain history (no time limit)")
 
     # ── Performance ─────────────────────────────────────────────────────────
-    p.add_argument("--winrate-min", type=float, default=0.0,
-                   metavar="PCT", help="Min winrate %% (0-100, default 0)")
-    p.add_argument("--winrate-max", type=float, default=100.0,
-                   metavar="PCT", help="Max winrate %% (0-100, default 100)")
-    p.add_argument("--pnl-min", type=float, default=None,
-                   metavar="SOL", help="Min PNL in SOL")
-    p.add_argument("--pnl-max", type=float, default=None,
-                   metavar="SOL", help="Max PNL in SOL")
+    p.add_argument("--winrate-min",  type=float, default=0.0,   metavar="PCT")
+    p.add_argument("--winrate-max",  type=float, default=100.0, metavar="PCT")
+    p.add_argument("--pnl-min",      type=float, default=None,  metavar="SOL")
+    p.add_argument("--pnl-max",      type=float, default=None,  metavar="SOL")
 
     # ── ROI Settings ────────────────────────────────────────────────────────
     p.add_argument("--roi-min",        type=float, default=None, metavar="PCT")
@@ -100,68 +121,62 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--avg-roi-max",    type=float, default=None, metavar="PCT")
 
     # ── Balances ────────────────────────────────────────────────────────────
-    p.add_argument("--sol-min", type=float, default=None,
-                   metavar="SOL", help="Min SOL balance")
-    p.add_argument("--sol-max", type=float, default=None,
-                   metavar="SOL", help="Max SOL balance")
-    p.add_argument("--usd-min", type=float, default=None,
-                   metavar="USD", help="Min USD balance")
-    p.add_argument("--usd-max", type=float, default=None,
-                   metavar="USD", help="Max USD balance")
+    p.add_argument("--sol-min", type=float, default=None, metavar="SOL")
+    p.add_argument("--sol-max", type=float, default=None, metavar="SOL")
+    p.add_argument("--usd-min", type=float, default=None, metavar="USD")
+    p.add_argument("--usd-max", type=float, default=None, metavar="USD")
 
     # ── Trading ─────────────────────────────────────────────────────────────
-    p.add_argument("--trade-providers", nargs="*", default=[],
-                   metavar="NAME",
-                   help="Filter by DEX (e.g. Raydium Orca Jupiter)")
-    p.add_argument("--pool-providers", nargs="*", default=[],
-                   metavar="NAME",
-                   help="Filter by pool providers")
-    p.add_argument("--pool-type",
-                   help="Filter by pool type name")
-    p.add_argument("--aggregators", nargs="*", default=[],
-                   metavar="NAME",
-                   help="Filter by aggregator (e.g. Jupiter)")
+    p.add_argument("--trade-providers", nargs="*", default=[], metavar="NAME")
+    p.add_argument("--pool-providers",  nargs="*", default=[], metavar="NAME")
+    p.add_argument("--pool-type",       default=None)
+    p.add_argument("--aggregators",     nargs="*", default=[], metavar="NAME")
 
     # ── Last / First Trade ──────────────────────────────────────────────────
-    p.add_argument("--last-trade-min",
-                   metavar="DUR",
-                   help="Min time since last trade (e.g. 1h, 30m, 1d12h)")
-    p.add_argument("--last-trade-max",
-                   metavar="DUR",
-                   help="Max time since last trade (e.g. 7d)")
-    p.add_argument("--first-trade-min",
-                   metavar="DUR",
-                   help="Min time since first trade")
-    p.add_argument("--first-trade-max",
-                   metavar="DUR",
-                   help="Max time since first trade")
+    p.add_argument("--last-trade-min",  metavar="DUR")
+    p.add_argument("--last-trade-max",  metavar="DUR",
+                   help="e.g. 7d, 12h, 30m")
+    p.add_argument("--first-trade-min", metavar="DUR")
+    p.add_argument("--first-trade-max", metavar="DUR")
 
     # ── Total Trades ────────────────────────────────────────────────────────
-    p.add_argument("--total-trades-min", type=int, default=None,
-                   metavar="N", help="Min total swap count")
-    p.add_argument("--total-trades-max", type=int, default=None,
-                   metavar="N", help="Max total swap count")
+    p.add_argument("--total-trades-min", type=int, default=None, metavar="N")
+    p.add_argument("--total-trades-max", type=int, default=None, metavar="N")
 
-    # ── Rockets count ────────────────────────────────────────────────────────
+    # ── Rockets ─────────────────────────────────────────────────────────────
     p.add_argument("--rockets-x2",  action="store_true",
-                   help="Wallet must have ≥1 token with ≥2× ROI")
+                   help="Must have ≥1 token with ≥2× ROI")
     p.add_argument("--rockets-x5",  action="store_true",
-                   help="Wallet must have ≥1 token with ≥5× ROI")
+                   help="Must have ≥1 token with ≥5× ROI")
     p.add_argument("--rockets-x10", action="store_true",
-                   help="Wallet must have ≥1 token with ≥10× ROI")
+                   help="Must have ≥1 token with ≥10× ROI")
 
     # ── Trade Duration ───────────────────────────────────────────────────────
-    p.add_argument("--trade-dur-min", type=int, default=None,
-                   metavar="SEC", help="Min avg trade duration in seconds")
-    p.add_argument("--trade-dur-max", type=int, default=None,
-                   metavar="SEC", help="Max avg trade duration in seconds")
+    p.add_argument("--trade-dur-min", type=int, default=None, metavar="SEC")
+    p.add_argument("--trade-dur-max", type=int, default=None, metavar="SEC")
 
     return p
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def load_wallets(path: str) -> list[str]:
+def _resolve_programs(names: Optional[List[str]]) -> Optional[List[str]]:
+    """Convert alias names (e.g. 'pump', 'raydium') to program IDs."""
+    if not names:
+        return None   # use all defaults
+    resolved = []
+    for name in names:
+        key = name.lower()
+        if key in PROGRAM_ALIASES:
+            resolved.append(PROGRAM_ALIASES[key])
+        elif name in SCAN_PROGRAMS:
+            resolved.append(name)   # already a program ID
+        else:
+            print(f"  [WARN] Unknown program alias '{name}' — skipped.")
+    return resolved or None
+
+
+def _load_file_wallets(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         return [
             line.strip()
@@ -172,9 +187,9 @@ def load_wallets(path: str) -> list[str]:
 
 def _banner() -> None:
     print()
-    print("  ╔══════════════════════════════════════════╗")
-    print("  ║   🐸 Froggy Scanner — Solana Wallet Parser  ║")
-    print("  ╚══════════════════════════════════════════╝")
+    print("  ╔══════════════════════════════════════════════╗")
+    print("  ║   🐸  Froggy Scanner — Solana Wallet Parser   ║")
+    print("  ╚══════════════════════════════════════════════╝")
     print()
 
 
@@ -187,32 +202,21 @@ def main() -> None:
     # ── API key ─────────────────────────────────────────────────────────────
     api_key = args.api_key or HELIUS_API_KEY
     if not api_key:
-        print("[ERROR] No Helius API key found.")
-        print("  Set HELIUS_API_KEY in your .env file or pass --api-key.")
-        print("  Free key: https://www.helius.dev/")
+        print("[ERROR] Helius API key not found.")
+        print("  → Copy .env.example to .env and set HELIUS_API_KEY")
+        print("  → Or pass --api-key YOUR_KEY")
+        print("  → Free key: https://www.helius.dev/")
         sys.exit(1)
 
     import config as cfg
     cfg.HELIUS_API_KEY = api_key
     cfg.RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
 
-    # ── Load wallet list ────────────────────────────────────────────────────
-    try:
-        wallet_addresses = load_wallets(args.input)
-    except FileNotFoundError:
-        print(f"[ERROR] Input file not found: {args.input}")
-        sys.exit(1)
-
-    if not wallet_addresses:
-        print("[ERROR] No wallet addresses in input file.")
-        sys.exit(1)
-
-    print(f"  Loaded {len(wallet_addresses)} wallet address(es) from {args.input}")
-
-    # ── Build FilterConfig ──────────────────────────────────────────────────
+    # ── FilterConfig ─────────────────────────────────────────────────────────
+    period_days = None if args.period_max else args.period_days
     filter_cfg = FilterConfig(
         min_sol_invest   = args.min_sol_invest,
-        period_days      = None if args.period_max else args.period_days,
+        period_days      = period_days,
         winrate_min      = args.winrate_min,
         winrate_max      = args.winrate_max,
         pnl_sol_min      = args.pnl_min,
@@ -246,41 +250,79 @@ def main() -> None:
     )
 
     period_label = f"{filter_cfg.period_days}d" if filter_cfg.period_days else "Max"
-    print(f"  Period: {period_label}  |  Min SOL invest: "
-          f"{filter_cfg.min_sol_invest or 'All'}  |  "
-          f"Filters: {'ON' if filter_cfg.active_filters else 'OFF'}")
+    print(f"  Period     : {period_label}")
+    print(f"  Scan limit : {args.scan_limit} wallets")
+    print(f"  Scan depth : {args.scan_depth} txs/program")
+    print(f"  Filters    : {'ON' if filter_cfg.active_filters else 'OFF'}")
+    print()
 
-    # ── Initialise components ───────────────────────────────────────────────
+    # ── Initialise components ────────────────────────────────────────────────
     fetcher  = WalletFetcher()
+    scanner  = BlockchainScanner(fetcher)
     analyzer = WalletAnalyzer()
     engine   = FilterEngine()
     exporter = DataExporter()
 
-    # ── Fetch SOL price once ────────────────────────────────────────────────
-    print("\n  Fetching SOL/USD price …")
+    # ── SOL price ────────────────────────────────────────────────────────────
+    print("  Fetching SOL/USD price …", flush=True)
     sol_price_usd = fetcher.get_sol_price_usd()
-    print(f"  SOL price: ${sol_price_usd:,.2f}")
+    print(f"  SOL price  : ${sol_price_usd:,.2f}\n")
 
-    # ── Process wallets ─────────────────────────────────────────────────────
-    all_stats = []
+    # ── Discover wallets from blockchain ─────────────────────────────────────
+    programs = _resolve_programs(args.scan_programs)
+    program_labels = (
+        [SCAN_PROGRAMS.get(p, p) for p in programs]
+        if programs
+        else list(SCAN_PROGRAMS.values())
+    )
+    print(f"  Scanning DEX programs: {', '.join(program_labels)}")
+    print()
+
+    wallet_addresses: List[str] = scanner.discover_wallets(
+        programs=programs,
+        max_wallets=args.scan_limit,
+        scan_txs_per_program=args.scan_depth,
+        period_days=filter_cfg.period_days,
+        verbose=True,
+    )
+
+    # ── Merge optional input file ─────────────────────────────────────────────
+    if args.input:
+        try:
+            extra = _load_file_wallets(args.input)
+        except FileNotFoundError:
+            print(f"  [WARN] Input file not found: {args.input} — ignored")
+            extra = []
+
+        existing: Set[str] = set(wallet_addresses)
+        added = [w for w in extra if w not in existing]
+        wallet_addresses.extend(added)
+        if added:
+            print(f"\n  Added {len(added)} wallet(s) from {args.input}")
+
     total = len(wallet_addresses)
+    if total == 0:
+        print("\n  No wallets discovered — check your API key or scan parameters.")
+        sys.exit(1)
 
-    print(f"\n  Processing {total} wallet(s) …\n")
+    print(f"\n  Discovered {total} unique wallet(s). Starting analysis …\n")
+
+    # ── Analyse each wallet ───────────────────────────────────────────────────
+    all_stats = []
 
     for idx, address in enumerate(wallet_addresses, 1):
-        # basic address validation
         if not (32 <= len(address) <= 44):
-            print(f"  [{idx:>4}/{total}] SKIP (invalid address) — {address}")
+            print(f"  [{idx:>5}/{total}] SKIP (invalid) — {address}")
             continue
 
-        print(f"  [{idx:>4}/{total}] {address[:20]}…", end=" ", flush=True)
+        print(f"  [{idx:>5}/{total}] {address[:20]}…", end=" ", flush=True)
 
         try:
             sol_bal = fetcher.get_sol_balance(address)
             raw_txs = fetcher.get_swap_transactions(address, filter_cfg.period_days)
 
             if not raw_txs:
-                print(f"| {sol_bal:.3f} SOL | 0 swaps — skipped")
+                print(f"| {sol_bal:.3f} SOL | 0 swaps — skip")
                 continue
 
             stats = analyzer.analyze_wallet(
@@ -295,10 +337,10 @@ def main() -> None:
             print(
                 f"| {stats.sol_balance:.3f} SOL"
                 f"  WR:{stats.winrate * 100:.0f}%"
-                f"  PNL:{stats.pnl_sol:+.3f} SOL"
-                f"  ROI:{stats.roi:.1f}%"
-                f"  Tokens:{stats.tokens_count}"
-                f"  x2:{stats.rockets_x2}/x5:{stats.rockets_x5}/x10:{stats.rockets_x10}"
+                f"  PNL:{stats.pnl_sol:+.3f}"
+                f"  ROI:{stats.roi:.0f}%"
+                f"  Tok:{stats.tokens_count}"
+                f"  🚀{stats.rockets_x2}/{stats.rockets_x5}/{stats.rockets_x10}"
             )
 
         except KeyboardInterrupt:
@@ -308,20 +350,18 @@ def main() -> None:
             print(f"| ERROR: {exc}")
             continue
 
-    # ── Apply filters ───────────────────────────────────────────────────────
+    # ── Apply filters ─────────────────────────────────────────────────────────
     print(f"\n  Analysed : {len(all_stats)} wallets")
-
     filtered = engine.apply(all_stats, filter_cfg)
     print(f"  Matched  : {len(filtered)} wallets after filters")
 
     if not filtered:
-        print("  No wallets match the specified criteria — nothing to export.")
+        print("  No wallets match the specified criteria.")
         sys.exit(0)
 
-    # Sort by PNL descending
     filtered.sort(key=lambda w: w.pnl_sol, reverse=True)
 
-    # ── Export ───────────────────────────────────────────────────────────────
+    # ── Export ────────────────────────────────────────────────────────────────
     print(f"\n  Exporting {len(filtered)} wallet(s) → {args.format} …")
     exporter.export(filtered, filter_cfg, args.format, args.extended, args.output_dir)
     print("\n  Done! 🐸\n")
