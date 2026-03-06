@@ -3,13 +3,14 @@ scanner.py — discovers active trader wallets by scanning Solana DEX programs.
 
 Strategy
 --------
-For every DEX program in SCAN_PROGRAMS we fetch recent SWAP transactions via
-the Helius Enhanced Transactions API.  Each transaction carries a `feePayer`
-field — the wallet that signed and paid for the swap.  We collect unique
-fee-payers across all programs to build a set of active trader wallets.
+For every DEX program in SCAN_PROGRAMS we:
+  1. Call getSignaturesForAddress (standard Solana RPC) to list recent tx sigs.
+  2. Filter by blockTime so we stay within the requested time window.
+  3. Batch-fetch full transactions (100 per RPC request) via getTransaction.
+  4. Extract feePayer (account[0]) — the wallet that signed and paid the fee.
 
-This lets main.py work with no input file at all: it discovers wallets straight
-from the blockchain and then feeds them to the existing analysis pipeline.
+This uses only the standard Solana JSON-RPC endpoint (mainnet.helius-rpc.com)
+so no Enhanced Transactions API / api.helius.xyz access is needed.
 """
 
 import time
@@ -119,6 +120,9 @@ class BlockchainScanner:
 
     # ── private ───────────────────────────────────────────────────────────────
 
+    # ── RPC batch size — 100 is safe for most RPC nodes ─────────────────────
+    _TX_BATCH = 100
+
     def _scan_program(
         self,
         program_id: str,
@@ -128,88 +132,99 @@ class BlockchainScanner:
         cap: int,
     ) -> List[str]:
         """
-        Page through Helius transactions for *program_id* and collect
-        unique fee-payer addresses not already in *seen*.
+        Discover fee-payer wallets for *program_id* using standard Solana RPC:
 
-        Note: the Helius `type=SWAP` query filter is only reliable for wallet
-        addresses, not for program accounts.  We fetch all transaction types
-        and identify swaps client-side by checking for token transfers.
+          1. getSignaturesForAddress  → page of up to 1 000 recent tx sigs
+          2. filter by blockTime       → skip txs outside the time window
+          3. batch getTransaction      → extract feePayer from accountKeys[0]
         """
         wallets: List[str] = []
         before_sig: Optional[str] = None
         fetched = 0
-        first_page = True
 
         while fetched < max_txs and len(wallets) < cap:
-            params: dict = {
-                "api-key": cfg.HELIUS_API_KEY,
-                "limit": 100,
-            }
+
+            # ── 1. signatures page ────────────────────────────────────────────
+            sig_params: list = [program_id, {"limit": 1000, "commitment": "finalized"}]
             if before_sig:
-                params["before"] = before_sig
+                sig_params[1]["before"] = before_sig
 
-            url = f"{cfg.HELIUS_API_URL}/addresses/{program_id}/transactions"
-            batch = self._fetcher._get(url, params=params)
+            sig_page = self._fetcher._post_rpc("getSignaturesForAddress", sig_params)
 
-            # ── diagnose first response ───────────────────────────────────────
-            if first_page:
-                first_page = False
-                if batch is None:
+            if sig_page is None:
+                if fetched == 0:
                     print(
-                        f"    [WARN] No response from Helius for {program_id[:12]}… "
-                        "(network error or invalid API key)",
+                        f"    [WARN] RPC getSignaturesForAddress failed for "
+                        f"{program_id[:12]}… — check RPC URL / API key",
                         flush=True,
                     )
-                    break
-                if isinstance(batch, dict):
-                    # Helius error: {"error": "...", "message": "..."}
-                    msg = batch.get("error") or batch.get("message") or str(batch)
-                    print(f"    [WARN] Helius API error: {msg}", flush=True)
-                    break
-                if not isinstance(batch, list):
-                    print(f"    [WARN] Unexpected response type: {type(batch)}", flush=True)
-                    break
-
-            if not batch:
-                break  # empty list → no more pages
-
-            if isinstance(batch, dict):
-                # error on subsequent pages
                 break
 
-            for tx in batch:
-                if not isinstance(tx, dict):
+            if not sig_page:
+                break   # no more signatures
+
+            # ── 2. filter by time window ──────────────────────────────────────
+            valid_sigs: List[str] = []
+            reached_cutoff = False
+            for entry in sig_page:
+                if entry.get("err"):          # failed on-chain tx — skip
                     continue
+                block_time = entry.get("blockTime") or 0
+                if cutoff and block_time and block_time < cutoff:
+                    reached_cutoff = True
+                    break
+                valid_sigs.append(entry["signature"])
 
-                # honour time-window
-                ts = tx.get("timestamp", 0)
-                if cutoff and ts < cutoff:
-                    return wallets   # transactions are newest-first → done
+            # ── 3. batch-fetch transactions ───────────────────────────────────
+            for chunk_start in range(0, len(valid_sigs), self._TX_BATCH):
+                chunk = valid_sigs[chunk_start: chunk_start + self._TX_BATCH]
 
-                # identify swaps: tx type SWAP, or has ≥1 token transfer
-                tx_type = tx.get("type", "")
-                token_transfers = tx.get("tokenTransfers") or []
-                is_swap = (tx_type == "SWAP") or (len(token_transfers) >= 1)
-                if not is_swap:
-                    continue
+                calls = [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": i,
+                        "method": "getTransaction",
+                        "params": [
+                            sig,
+                            {
+                                "encoding": "jsonParsed",
+                                "maxSupportedTransactionVersion": 0,
+                                "commitment": "finalized",
+                            },
+                        ],
+                    }
+                    for i, sig in enumerate(chunk)
+                ]
 
-                payer = tx.get("feePayer") or ""
-                if not payer or len(payer) < 32:
-                    continue
-                if payer in seen:
-                    continue
+                results = self._fetcher._post_rpc_batch(calls)
+                time.sleep(self._PAGE_SLEEP)
 
-                seen.add(payer)
-                wallets.append(payer)
+                for tx in results:
+                    if not isinstance(tx, dict):
+                        continue
+                    try:
+                        keys = tx["transaction"]["message"]["accountKeys"]
+                        # parsed encoding: list of {"pubkey":…, "signer":…}
+                        # legacy encoding: list of plain base58 strings
+                        first = keys[0]
+                        payer = first["pubkey"] if isinstance(first, dict) else first
+                    except (KeyError, IndexError, TypeError):
+                        continue
 
-                if len(wallets) >= cap:
-                    return wallets
+                    if not payer or len(payer) < 32 or payer in seen:
+                        continue
 
-            fetched += len(batch)
-            if len(batch) < 100:
-                break
+                    seen.add(payer)
+                    wallets.append(payer)
 
-            before_sig = batch[-1]["signature"]
-            time.sleep(self._PAGE_SLEEP)
+                    if len(wallets) >= cap:
+                        return wallets
+
+            fetched += len(sig_page)
+
+            if len(sig_page) < 1000 or reached_cutoff:
+                break   # last page or hit time cutoff
+
+            before_sig = sig_page[-1]["signature"]
 
         return wallets

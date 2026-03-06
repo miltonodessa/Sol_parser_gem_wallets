@@ -70,6 +70,29 @@ class WalletFetcher:
                     print(f"  [fetcher] RPC {method} failed: {exc}", file=sys.stderr)
         return None
 
+    def _post_rpc_batch(self, calls: list, retries: int = 3) -> list:
+        """
+        Send a JSON-RPC batch request (list of call objects).
+        Returns a list of `result` values in the same order; None for failed calls.
+        """
+        for attempt, sleep in enumerate([0] + self._RETRY_SLEEPS[:retries]):
+            if sleep:
+                time.sleep(sleep)
+            try:
+                r = self._session.post(cfg.RPC_URL, json=calls, timeout=60)
+                if r.status_code == 429:
+                    time.sleep(sleep or 2)
+                    continue
+                if r.status_code == 200:
+                    responses = r.json()
+                    if isinstance(responses, list):
+                        return [resp.get("result") for resp in responses]
+                    return []
+            except requests.RequestException as exc:
+                if attempt == retries:
+                    print(f"  [fetcher] batch RPC failed: {exc}", file=sys.stderr)
+        return []
+
     # ── public API ────────────────────────────────────────────────────────────
 
     def get_sol_balance(self, address: str) -> float:
