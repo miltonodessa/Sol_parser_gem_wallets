@@ -128,17 +128,21 @@ class BlockchainScanner:
         cap: int,
     ) -> List[str]:
         """
-        Page through Helius SWAP transactions for *program_id* and collect
+        Page through Helius transactions for *program_id* and collect
         unique fee-payer addresses not already in *seen*.
+
+        Note: the Helius `type=SWAP` query filter is only reliable for wallet
+        addresses, not for program accounts.  We fetch all transaction types
+        and identify swaps client-side by checking for token transfers.
         """
         wallets: List[str] = []
         before_sig: Optional[str] = None
         fetched = 0
+        first_page = True
 
         while fetched < max_txs and len(wallets) < cap:
             params: dict = {
                 "api-key": cfg.HELIUS_API_KEY,
-                "type": "SWAP",
                 "limit": 100,
             }
             if before_sig:
@@ -147,18 +151,47 @@ class BlockchainScanner:
             url = f"{cfg.HELIUS_API_URL}/addresses/{program_id}/transactions"
             batch = self._fetcher._get(url, params=params)
 
-            if batch is None:
-                # API error (network / auth) — stop paging this program
-                break
+            # ── diagnose first response ───────────────────────────────────────
+            if first_page:
+                first_page = False
+                if batch is None:
+                    print(
+                        f"    [WARN] No response from Helius for {program_id[:12]}… "
+                        "(network error or invalid API key)",
+                        flush=True,
+                    )
+                    break
+                if isinstance(batch, dict):
+                    # Helius error: {"error": "...", "message": "..."}
+                    msg = batch.get("error") or batch.get("message") or str(batch)
+                    print(f"    [WARN] Helius API error: {msg}", flush=True)
+                    break
+                if not isinstance(batch, list):
+                    print(f"    [WARN] Unexpected response type: {type(batch)}", flush=True)
+                    break
+
             if not batch:
-                # empty page — no more transactions
+                break  # empty list → no more pages
+
+            if isinstance(batch, dict):
+                # error on subsequent pages
                 break
 
             for tx in batch:
+                if not isinstance(tx, dict):
+                    continue
+
                 # honour time-window
                 ts = tx.get("timestamp", 0)
                 if cutoff and ts < cutoff:
                     return wallets   # transactions are newest-first → done
+
+                # identify swaps: tx type SWAP, or has ≥1 token transfer
+                tx_type = tx.get("type", "")
+                token_transfers = tx.get("tokenTransfers") or []
+                is_swap = (tx_type == "SWAP") or (len(token_transfers) >= 1)
+                if not is_swap:
+                    continue
 
                 payer = tx.get("feePayer") or ""
                 if not payer or len(payer) < 32:
@@ -168,6 +201,9 @@ class BlockchainScanner:
 
                 seen.add(payer)
                 wallets.append(payer)
+
+                if len(wallets) >= cap:
+                    return wallets
 
                 if len(wallets) >= cap:
                     return wallets
