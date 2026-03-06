@@ -5,15 +5,25 @@ Strategy
 --------
 For every DEX program in SCAN_PROGRAMS we:
   1. Call getSignaturesForAddress (standard Solana RPC) to list recent tx sigs.
-  2. Filter by blockTime so we stay within the requested time window.
-  3. Batch-fetch full transactions (100 per RPC request) via getTransaction.
-  4. Extract feePayer (account[0]) — the wallet that signed and paid the fee.
+     Each entry carries slot + blockTime — no full tx fetch needed yet.
+  2. Filter entries by blockTime (time window) and group them by slot number.
+  3. For each unique slot, call getBlock once (transactionDetails="accounts").
+     One block can cover hundreds of signatures from the same slot — far more
+     efficient than one getTransaction call per signature.
+  4. Match the block's transaction signatures against our target set and extract
+     accountKeys[0] (feePayer — always the first key by Solana protocol).
 
-This uses only the standard Solana JSON-RPC endpoint (mainnet.helius-rpc.com)
-so no Enhanced Transactions API / api.helius.xyz access is needed.
+Why getBlock instead of getTransaction × N:
+  Pump.fun can have 300-1 000+ transactions per slot. Fetching 1 000 sigs may
+  require only 5-20 getBlock calls instead of 1 000 getTransaction calls.
+  getBlock + transactionDetails=accounts is also much lighter than jsonParsed.
+
+No Enhanced Transactions API (api.helius.xyz) is used; only the standard
+Solana JSON-RPC endpoint (mainnet.helius-rpc.com) which is free for all plans.
 """
 
 import time
+from collections import defaultdict
 from typing import Dict, List, Optional, Set
 
 import config as cfg
@@ -120,9 +130,6 @@ class BlockchainScanner:
 
     # ── private ───────────────────────────────────────────────────────────────
 
-    # ── RPC batch size — 100 is safe for most RPC nodes ─────────────────────
-    _TX_BATCH = 100
-
     def _scan_program(
         self,
         program_id: str,
@@ -132,11 +139,11 @@ class BlockchainScanner:
         cap: int,
     ) -> List[str]:
         """
-        Discover fee-payer wallets for *program_id* using standard Solana RPC:
+        Discover fee-payer wallets for *program_id*.
 
-          1. getSignaturesForAddress  → page of up to 1 000 recent tx sigs
-          2. filter by blockTime       → skip txs outside the time window
-          3. batch getTransaction      → extract feePayer from accountKeys[0]
+        Uses getSignaturesForAddress → group by slot → getBlock per slot.
+        One block call covers all signatures in that slot (often hundreds),
+        making this far more efficient than one getTransaction per signature.
         """
         wallets: List[str] = []
         before_sig: Optional[str] = None
@@ -144,7 +151,7 @@ class BlockchainScanner:
 
         while fetched < max_txs and len(wallets) < cap:
 
-            # ── 1. signatures page ────────────────────────────────────────────
+            # ── 1. get a page of recent signatures ────────────────────────────
             sig_params: list = [program_id, {"limit": 1000, "commitment": "finalized"}]
             if before_sig:
                 sig_params[1]["before"] = before_sig
@@ -161,52 +168,51 @@ class BlockchainScanner:
                 break
 
             if not sig_page:
-                break   # no more signatures
+                break   # no more history
 
-            # ── 2. filter by time window ──────────────────────────────────────
-            valid_sigs: List[str] = []
+            # ── 2. filter by time window and group by slot ────────────────────
+            # slot → set of target signatures in that slot
+            slot_sigs: Dict[int, set] = defaultdict(set)
             reached_cutoff = False
+
             for entry in sig_page:
-                if entry.get("err"):          # failed on-chain tx — skip
+                if entry.get("err"):       # failed on-chain tx — skip
                     continue
                 block_time = entry.get("blockTime") or 0
                 if cutoff and block_time and block_time < cutoff:
                     reached_cutoff = True
                     break
-                valid_sigs.append(entry["signature"])
+                slot = entry.get("slot")
+                if slot is not None:
+                    slot_sigs[slot].add(entry["signature"])
 
-            # ── 3. batch-fetch transactions ───────────────────────────────────
-            for chunk_start in range(0, len(valid_sigs), self._TX_BATCH):
-                chunk = valid_sigs[chunk_start: chunk_start + self._TX_BATCH]
-
-                calls = [
-                    {
-                        "jsonrpc": "2.0",
-                        "id": i,
-                        "method": "getTransaction",
-                        "params": [
-                            sig,
-                            {
-                                "encoding": "jsonParsed",
-                                "maxSupportedTransactionVersion": 0,
-                                "commitment": "finalized",
-                            },
-                        ],
-                    }
-                    for i, sig in enumerate(chunk)
-                ]
-
-                results = self._fetcher._post_rpc_batch(calls)
+            # ── 3. one getBlock call per unique slot ──────────────────────────
+            for slot, target_sigs in slot_sigs.items():
+                block = self._fetcher._post_rpc(
+                    "getBlock",
+                    [
+                        slot,
+                        {
+                            "encoding": "jsonParsed",
+                            "maxSupportedTransactionVersion": 0,
+                            "transactionDetails": "accounts",   # minimal payload
+                            "rewards": False,
+                        },
+                    ],
+                )
                 time.sleep(self._PAGE_SLEEP)
 
-                for tx in results:
-                    if not isinstance(tx, dict):
-                        continue
+                if not isinstance(block, dict):
+                    continue
+
+                for tx in block.get("transactions", []):
                     try:
-                        keys = tx["transaction"]["message"]["accountKeys"]
-                        # parsed encoding: list of {"pubkey":…, "signer":…}
-                        # legacy encoding: list of plain base58 strings
-                        first = keys[0]
+                        tx_data = tx["transaction"]
+                        sig = tx_data["signatures"][0]
+                        if sig not in target_sigs:
+                            continue   # not one of ours
+                        # accountKeys[0] is always feePayer (Solana protocol)
+                        first = tx_data["accountKeys"][0]
                         payer = first["pubkey"] if isinstance(first, dict) else first
                     except (KeyError, IndexError, TypeError):
                         continue
@@ -223,7 +229,7 @@ class BlockchainScanner:
             fetched += len(sig_page)
 
             if len(sig_page) < 1000 or reached_cutoff:
-                break   # last page or hit time cutoff
+                break   # last page or passed the time cutoff
 
             before_sig = sig_page[-1]["signature"]
 
