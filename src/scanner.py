@@ -205,9 +205,6 @@ class BlockchainScanner:
                 if len(wallets) >= cap:
                     return wallets
 
-                if len(wallets) >= cap:
-                    return wallets
-
             fetched += len(batch)
             if len(batch) < 100:
                 break

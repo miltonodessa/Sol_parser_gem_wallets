@@ -31,11 +31,24 @@ class WalletFetcher:
                 time.sleep(sleep)
             try:
                 r = self._session.get(url, params=params, timeout=30)
-                if r.status_code == 429:          # rate-limited
-                    time.sleep(sleep or 2)
-                    continue
                 if r.status_code == 200:
                     return r.json()
+                if r.status_code == 429:          # rate-limited — retry
+                    time.sleep(sleep or 2)
+                    continue
+                # 4xx client errors — no point retrying (bad key, not found…)
+                if 400 <= r.status_code < 500:
+                    try:
+                        body = r.json()
+                        msg = body.get("error") or body.get("message") or r.text[:120]
+                    except Exception:
+                        msg = r.text[:120]
+                    print(
+                        f"  [fetcher] HTTP {r.status_code} — {msg}",
+                        file=sys.stderr,
+                    )
+                    return None
+                # 5xx — retry
             except requests.RequestException as exc:
                 if attempt == retries:
                     print(f"  [fetcher] GET {url} failed: {exc}", file=sys.stderr)
