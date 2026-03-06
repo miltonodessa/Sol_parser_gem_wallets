@@ -13,8 +13,8 @@ Quick start
   # copy .env.example → .env  and fill in HELIUS_API_KEY
   python main.py
 
-  # scan specific DEX only, top-1000 wallets, last 30 days
-  python main.py --scan-programs pump raydium --scan-limit 1000 --period-days 30
+  # scan specific DEX only, top-5000 wallets, last 30 days
+  python main.py --scan-programs pump raydium --scan-limit 5000 --period-days 30
 
   # add filters and export
   python main.py \\
@@ -57,10 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Blockchain scan ─────────────────────────────────────────────────────
     scan = p.add_argument_group("Blockchain scan")
-    scan.add_argument("--scan-limit", type=int, default=1000,
+    scan.add_argument("--scan-limit", type=int, default=None,
                       metavar="N",
-                      help="Max unique wallets to discover from the blockchain "
-                           "(default: 1000)")
+                      help="Max unique wallets to discover from the blockchain. "
+                           "If not set, you will be asked interactively.")
     scan.add_argument("--scan-depth", type=int, default=2000,
                       metavar="N",
                       help="Max transactions to read per DEX program "
@@ -185,6 +185,21 @@ def _load_file_wallets(path: str) -> List[str]:
         ]
 
 
+def _ask_scan_limit() -> int:
+    """Prompt the user to enter how many wallets to scan. Validates input."""
+    print("  How many wallets do you want to scan?")
+    print("  (Enter a number, e.g. 500 / 5000 / 50000 — or 0 for unlimited)\n")
+    while True:
+        try:
+            raw = input("  Wallets to scan: ").strip()
+            val = int(raw)
+            if val < 0:
+                raise ValueError
+            return val if val > 0 else 10_000_000   # 0 → unlimited
+        except (ValueError, EOFError):
+            print("  Please enter a valid positive integer (or 0 for unlimited).")
+
+
 def _banner() -> None:
     print()
     print("  ╔══════════════════════════════════════════════╗")
@@ -249,9 +264,14 @@ def main() -> None:
         active_filters   = not args.no_filters,
     )
 
+    # ── Scan limit (interactive if not passed via CLI) ───────────────────────
+    scan_limit: int = args.scan_limit if args.scan_limit is not None else _ask_scan_limit()
+    print()
+
     period_label = f"{filter_cfg.period_days}d" if filter_cfg.period_days else "Max"
+    limit_label  = f"{scan_limit:,}" if scan_limit < 10_000_000 else "Unlimited"
     print(f"  Period     : {period_label}")
-    print(f"  Scan limit : {args.scan_limit} wallets")
+    print(f"  Scan limit : {limit_label} wallets")
     print(f"  Scan depth : {args.scan_depth} txs/program")
     print(f"  Filters    : {'ON' if filter_cfg.active_filters else 'OFF'}")
     print()
@@ -280,7 +300,7 @@ def main() -> None:
 
     wallet_addresses: List[str] = scanner.discover_wallets(
         programs=programs,
-        max_wallets=args.scan_limit,
+        max_wallets=scan_limit,
         scan_txs_per_program=args.scan_depth,
         period_days=filter_cfg.period_days,
         verbose=True,
